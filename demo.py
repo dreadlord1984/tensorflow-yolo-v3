@@ -2,72 +2,97 @@
 
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageDraw
+from PIL import Image
+import time
 
-from yolo_v3 import yolo_v3, load_weights, detections_boxes, non_max_suppression
+import yolo_v3
+import yolo_v3_tiny
+
+from utils import load_coco_names, draw_boxes, get_boxes_and_inputs, get_boxes_and_inputs_pb, non_max_suppression, \
+                  load_graph, letter_box_image
 
 FLAGS = tf.app.flags.FLAGS
 
-tf.app.flags.DEFINE_string('input_img', '', 'Input image')
-tf.app.flags.DEFINE_string('output_img', '', 'Output image')
-tf.app.flags.DEFINE_string('class_names', 'coco.names', 'File with class names')
-tf.app.flags.DEFINE_string('weights_file', 'yolov3.weights', 'Binary file with detector weights')
+tf.app.flags.DEFINE_string(
+    'input_img', '', 'Input image')
+tf.app.flags.DEFINE_string(
+    'output_img', '', 'Output image')
+tf.app.flags.DEFINE_string(
+    'class_names', 'coco.names', 'File with class names')
+tf.app.flags.DEFINE_string(
+    'weights_file', 'yolov3.weights', 'Binary file with detector weights')
+tf.app.flags.DEFINE_string(
+    'data_format', 'NCHW', 'Data format: NCHW (gpu only) / NHWC')
+tf.app.flags.DEFINE_string(
+    'ckpt_file', './saved_model/model.ckpt', 'Checkpoint file')
+tf.app.flags.DEFINE_string(
+    'frozen_model', '', 'Frozen tensorflow protobuf model')
+tf.app.flags.DEFINE_bool(
+    'tiny', False, 'Use tiny version of YOLOv3')
 
-tf.app.flags.DEFINE_integer('size', 416, 'Image size')
+tf.app.flags.DEFINE_integer(
+    'size', 416, 'Image size')
 
-tf.app.flags.DEFINE_float('conf_threshold', 0.5, 'Confidence threshold')
-tf.app.flags.DEFINE_float('iou_threshold', 0.4, 'IoU threshold')
+tf.app.flags.DEFINE_float(
+    'conf_threshold', 0.5, 'Confidence threshold')
+tf.app.flags.DEFINE_float(
+    'iou_threshold', 0.4, 'IoU threshold')
 
-
-def load_coco_names(file_name):
-    names = {}
-    with open(file_name) as f:
-        for id, name in enumerate(f):
-            names[id] = name
-    return names
-
-
-def draw_boxes(boxes, img, cls_names, detection_size):
-    draw = ImageDraw.Draw(img)
-
-    for cls, bboxs in boxes.items():
-        color = tuple(np.random.randint(0, 256, 3))
-        for box, score in bboxs:
-            box = convert_to_original_size(box, np.array(detection_size), np.array(img.size))
-            draw.rectangle(box, outline=color)
-            draw.text(box[:2], '{} {:.2f}%'.format(cls_names[cls], score * 100), fill=color)
-
-
-def convert_to_original_size(box, size, original_size):
-    ratio = original_size / size
-    box = box.reshape(2, 2) * ratio
-    return list(box.reshape(-1))
-
+tf.app.flags.DEFINE_float(
+    'gpu_memory_fraction', 1.0, 'Gpu memory fraction to use')
 
 def main(argv=None):
-    img = Image.open(FLAGS.input_img)
-    img_resized = img.resize(size=(FLAGS.size, FLAGS.size))
 
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=FLAGS.gpu_memory_fraction)
+
+    config = tf.ConfigProto(
+        gpu_options=gpu_options,
+        log_device_placement=False,
+    )
+
+    img = Image.open(FLAGS.input_img)
+    img_resized = letter_box_image(img, FLAGS.size, FLAGS.size, 128)
+    img_resized = img_resized.astype(np.float32)
     classes = load_coco_names(FLAGS.class_names)
 
-    # placeholder for detector inputs
-    inputs = tf.placeholder(tf.float32, [None, FLAGS.size, FLAGS.size, 3])
+    if FLAGS.frozen_model:
 
-    with tf.variable_scope('detector'):
-        detections = yolo_v3(inputs, len(classes), data_format='NCHW')
-        load_ops = load_weights(tf.global_variables(scope='detector'), FLAGS.weights_file)
+        t0 = time.time()
+        frozenGraph = load_graph(FLAGS.frozen_model)
+        print("Loaded graph in {:.2f}s".format(time.time()-t0))
 
-    boxes = detections_boxes(detections)
+        boxes, inputs = get_boxes_and_inputs_pb(frozenGraph)
 
-    with tf.Session() as sess:
-        sess.run(load_ops)
+        with tf.Session(graph=frozenGraph, config=config) as sess:
+            t0 = time.time()
+            detected_boxes = sess.run(
+                boxes, feed_dict={inputs: [img_resized]})
 
-        detected_boxes = sess.run(boxes, feed_dict={inputs: [np.array(img_resized, dtype=np.float32)]})
+    else:
+        if FLAGS.tiny:
+            model = yolo_v3_tiny.yolo_v3_tiny
+        else:
+            model = yolo_v3.yolo_v3
 
-    filtered_boxes = non_max_suppression(detected_boxes, confidence_threshold=FLAGS.conf_threshold,
+        boxes, inputs = get_boxes_and_inputs(model, len(classes), FLAGS.size, FLAGS.data_format)
+
+        saver = tf.train.Saver(var_list=tf.global_variables(scope='detector'))
+
+        with tf.Session(config=config) as sess:
+            t0 = time.time()
+            saver.restore(sess, FLAGS.ckpt_file)
+            print('Model restored in {:.2f}s'.format(time.time()-t0))
+
+            t0 = time.time()
+            detected_boxes = sess.run(
+                boxes, feed_dict={inputs: [img_resized]})
+
+    filtered_boxes = non_max_suppression(detected_boxes,
+                                         confidence_threshold=FLAGS.conf_threshold,
                                          iou_threshold=FLAGS.iou_threshold)
+    print("Predictions found in {:.2f}s".format(time.time() - t0))
 
-    draw_boxes(filtered_boxes, img, classes, (FLAGS.size, FLAGS.size))
+    draw_boxes(filtered_boxes, img, classes, (FLAGS.size, FLAGS.size), True)
 
     img.save(FLAGS.output_img)
 
